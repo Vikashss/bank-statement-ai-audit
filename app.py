@@ -27,7 +27,7 @@ except Exception:
 st.set_page_config(page_title="Bank Statement Reader", page_icon="📄", layout="wide")
 
 # -------------------- Constants --------------------
-AG_IMAGE_PATH = "A.G(Audit).jpg"
+AG_IMAGE_PATH = "assets/AG_Audit.jpg"
 USAGE_LOG_FILE = "app_usage_log.xlsx"
 ADMIN_PASSWORD = "Audit@123"   # change this password
 
