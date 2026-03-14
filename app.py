@@ -189,8 +189,128 @@ def score_page_text(text):
     balances = len(BAL_RE.findall(text))
     dates_any = len(DATE_ANY_RE.findall(text))
     return (date_starts * 10) + (balances * 4) + dates_any + len(lines) * 0.05
+#---------------------------------------------------
+def lightweight_preclassify(text):
 
+    text = clean(text).upper()
 
+    if not text:
+        return {"label": "UNKNOWN", "score": 0.0}
+
+    if any(word in text for word in [
+        "BANK CHARGE", "GST", "SMS CHARGE",
+        "INTEREST", "SERVICE CHARGE"
+    ]):
+        return {"label": "BANK_INTERNAL", "score": 0.99}
+
+    if any(word in text for word in [
+        "GOVT", "GOVERNMENT", "TREASURY", "SECRETARIAT"
+    ]):
+        return {"label": "GOVERNMENT", "score": 0.95}
+
+    return None
+    def classify_narration_ai(text, classifier):
+
+    text = clean(text)
+
+    pre = lightweight_preclassify(text)
+
+    if pre:
+        return pre
+
+    if classifier is None:
+        return {"label": "UNKNOWN", "score": 0}
+
+    candidate_labels = [
+        "individual person",
+        "private company or business",
+        "government office",
+        "bank internal transaction",
+        "unknown entity"
+    ]
+
+    result = classifier(text, candidate_labels)
+
+    label_map = {
+        "individual person": "INDIVIDUAL",
+        "private company or business": "PRIVATE_COMPANY",
+        "government office": "GOVERNMENT",
+        "bank internal transaction": "BANK_INTERNAL",
+        "unknown entity": "UNKNOWN",
+    }
+
+    return {
+        "label": label_map[result["labels"][0]],
+        "score": float(result["scores"][0])
+    }
+    @st.cache_data(show_spinner=False)
+def classify_unique_descriptions(descriptions):
+
+    classifier = load_zero_shot_model()
+
+    result_map = {}
+
+    for desc in descriptions:
+        result_map[desc] = classify_narration_ai(desc, classifier)
+
+    return result_map
+    def ai_risk_decision(description, debit, credit, ai_result):
+
+    text = clean(description).upper()
+
+    entity = ai_result["label"]
+    confidence = ai_result["score"]
+
+    amount = max(float(debit or 0), float(credit or 0))
+
+    score = 0
+    reasons = []
+
+    if entity == "INDIVIDUAL":
+        score += 35
+        reasons.append("Individual detected")
+
+    elif entity == "PRIVATE_COMPANY":
+        score += 30
+        reasons.append("Private company detected")
+
+    elif entity == "UNKNOWN":
+        score += 15
+        reasons.append("Unknown entity")
+
+    if any(x in text for x in ["NEFT", "IMPS", "UPI", "RTGS", "TRANSFER"]):
+        score += 20
+        reasons.append("Electronic transfer")
+
+    if amount >= 50000:
+        score += 10
+        reasons.append("Amount > 50k")
+
+    if amount >= 200000:
+        score += 15
+        reasons.append("Amount > 2L")
+
+    if confidence < 0.45:
+        score += 10
+        reasons.append("Low AI confidence")
+
+    if score >= 75:
+        level = "Very High"
+    elif score >= 50:
+        level = "High"
+    elif score >= 30:
+        level = "Medium"
+    else:
+        level = "Low"
+
+    return {
+        "entity_type": entity,
+        "confidence": confidence,
+        "risk_score": score,
+        "risk_level": level,
+        "risk_reason": "; ".join(reasons)
+    }
+    run_analysis = st.button("Run Analysis", use_container_width=True)
 # -------------------- OCR Functions --------------------
 def preprocess_ocr_image(pil_img):
     img = pil_img.convert("L")
@@ -413,19 +533,15 @@ def process_pdf(file_obj, opening_balance=None):
 
     return df, failed_blocks, len(blocks), ocr_used_pages
 
-
-# -------------------- AI Model --------------------
+#----------AI---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_zero_shot_model():
-    if not AI_AVAILABLE:
-        return None
     try:
-        # lighter than bart-large-mnli
-        clf = pipeline(
+        classifier = pipeline(
             "zero-shot-classification",
             model="valhalla/distilbart-mnli-12-1"
         )
-        return clf
+        return classifier
     except Exception:
         return None
 
@@ -573,20 +689,23 @@ def ai_risk_decision(description, debit, credit, classifier):
     }
 
 
-def detect_high_risk_ai(df):
+ddef detect_high_risk_ai(df):
+
     if df.empty:
         return df.copy(), df.copy(), df.copy()
 
-    classifier = load_zero_shot_model()
-
     result_df = df.copy()
+
+    unique_desc = result_df["Description"].fillna("").unique().tolist()
+
+    classification_map = classify_unique_descriptions(unique_desc)
 
     ai_results = result_df.apply(
         lambda row: ai_risk_decision(
-            row.get("Description", ""),
-            row.get("Debit_num", 0),
-            row.get("Credit_num", 0),
-            classifier,
+            row["Description"],
+            row["Debit_num"],
+            row["Credit_num"],
+            classification_map.get(row["Description"], {"label": "UNKNOWN", "score": 0})
         ),
         axis=1
     )
@@ -597,19 +716,21 @@ def detect_high_risk_ai(df):
     result_df["AI Risk Level"] = ai_results.apply(lambda x: x["risk_level"])
     result_df["AI Risk Reason"] = ai_results.apply(lambda x: x["risk_reason"])
 
-    high_risk_debit = result_df[
+    high_debit = result_df[
         (result_df["Debit_num"] > 0) &
         (result_df["AI Risk Level"].isin(["High", "Very High"]))
-    ].copy()
+    ]
 
-    high_risk_credit = result_df[
+    high_credit = result_df[
         (result_df["Credit_num"] > 0) &
         (result_df["AI Risk Level"].isin(["High", "Very High"]))
-    ].copy()
+    ]
 
-    return result_df, high_risk_debit, high_risk_credit
-
-
+    return result_df, high_debit, high_credit
+@st.cache_data(show_spinner=False)
+def process_pdf_cached(file_bytes, opening_balance):
+    file_obj = BytesIO(file_bytes)
+    return process_pdf(file_obj, opening_balance)
 # -------------------- Excel Export --------------------
 def to_excel_bytes(df, sheet_name="Statement"):
     output = BytesIO()
