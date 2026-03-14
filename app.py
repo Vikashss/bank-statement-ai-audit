@@ -23,12 +23,11 @@ try:
 except Exception:
     AI_AVAILABLE = False
 
-
 st.set_page_config(page_title="Bank Statement Reader", page_icon="📄", layout="wide")
 
 # -------------------- Constants --------------------
 AG_IMAGE_PATH = "assets/AG_Audit.jpg"
-USAGE_LOG_FILE = "app_usage_log.xlsx"
+USAGE_LOG_FILE = "data/app_usage_log.xlsx"
 ADMIN_PASSWORD = "Audit@123"   # change this password
 
 DATE_START_RE = re.compile(r'^\s*(\d{2}-\d{2}-\d{4})\b')
@@ -92,6 +91,8 @@ STOP_WORDS = [
     "END OF STATEMENT",
 ]
 
+TRANSFER_WORDS = ["NEFT", "IMPS", "UPI", "RTGS", "TRF", "TRANSFER"]
+
 DISPLAY_COLUMNS = [
     "Date",
     "Description",
@@ -107,13 +108,6 @@ DISPLAY_COLUMNS = [
     "AI Risk Score",
     "AI Risk Level",
     "AI Risk Reason",
-]
-
-TRANSFER_WORDS = ["NEFT", "IMPS", "UPI", "RTGS", "TRF", "TRANSFER"]
-BANK_INTERNAL_HINTS = [
-    "BANK CHARGE", "BANK CHARGES", "INTEREST", "SMS CHARGE", "SERVICE CHARGE",
-    "ATM CHARGE", "ANNUAL CHARGE", "GST", "TAX", "RENEWAL", "COMMISSION",
-    "CHQ", "CHEQUE", "CLEARING", "B/F", "C/F"
 ]
 
 # -------------------- Utility Functions --------------------
@@ -189,128 +183,8 @@ def score_page_text(text):
     balances = len(BAL_RE.findall(text))
     dates_any = len(DATE_ANY_RE.findall(text))
     return (date_starts * 10) + (balances * 4) + dates_any + len(lines) * 0.05
-#---------------------------------------------------
-def lightweight_preclassify(text):
 
-    text = clean(text).upper()
 
-    if not text:
-        return {"label": "UNKNOWN", "score": 0.0}
-
-    if any(word in text for word in [
-        "BANK CHARGE", "GST", "SMS CHARGE",
-        "INTEREST", "SERVICE CHARGE"
-    ]):
-        return {"label": "BANK_INTERNAL", "score": 0.99}
-
-    if any(word in text for word in [
-        "GOVT", "GOVERNMENT", "TREASURY", "SECRETARIAT"
-    ]):
-        return {"label": "GOVERNMENT", "score": 0.95}
-
-    return None
-    def classify_narration_ai(text, classifier):
-
-    text = clean(text)
-
-    pre = lightweight_preclassify(text)
-
-    if pre:
-        return pre
-
-    if classifier is None:
-        return {"label": "UNKNOWN", "score": 0}
-
-    candidate_labels = [
-        "individual person",
-        "private company or business",
-        "government office",
-        "bank internal transaction",
-        "unknown entity"
-    ]
-
-    result = classifier(text, candidate_labels)
-
-    label_map = {
-        "individual person": "INDIVIDUAL",
-        "private company or business": "PRIVATE_COMPANY",
-        "government office": "GOVERNMENT",
-        "bank internal transaction": "BANK_INTERNAL",
-        "unknown entity": "UNKNOWN",
-    }
-
-    return {
-        "label": label_map[result["labels"][0]],
-        "score": float(result["scores"][0])
-    }
-    @st.cache_data(show_spinner=False)
-def classify_unique_descriptions(descriptions):
-
-    classifier = load_zero_shot_model()
-
-    result_map = {}
-
-    for desc in descriptions:
-        result_map[desc] = classify_narration_ai(desc, classifier)
-
-    return result_map
-    def ai_risk_decision(description, debit, credit, ai_result):
-
-    text = clean(description).upper()
-
-    entity = ai_result["label"]
-    confidence = ai_result["score"]
-
-    amount = max(float(debit or 0), float(credit or 0))
-
-    score = 0
-    reasons = []
-
-    if entity == "INDIVIDUAL":
-        score += 35
-        reasons.append("Individual detected")
-
-    elif entity == "PRIVATE_COMPANY":
-        score += 30
-        reasons.append("Private company detected")
-
-    elif entity == "UNKNOWN":
-        score += 15
-        reasons.append("Unknown entity")
-
-    if any(x in text for x in ["NEFT", "IMPS", "UPI", "RTGS", "TRANSFER"]):
-        score += 20
-        reasons.append("Electronic transfer")
-
-    if amount >= 50000:
-        score += 10
-        reasons.append("Amount > 50k")
-
-    if amount >= 200000:
-        score += 15
-        reasons.append("Amount > 2L")
-
-    if confidence < 0.45:
-        score += 10
-        reasons.append("Low AI confidence")
-
-    if score >= 75:
-        level = "Very High"
-    elif score >= 50:
-        level = "High"
-    elif score >= 30:
-        level = "Medium"
-    else:
-        level = "Low"
-
-    return {
-        "entity_type": entity,
-        "confidence": confidence,
-        "risk_score": score,
-        "risk_level": level,
-        "risk_reason": "; ".join(reasons)
-    }
-    run_analysis = st.button("Run Analysis", use_container_width=True)
 # -------------------- OCR Functions --------------------
 def preprocess_ocr_image(pil_img):
     img = pil_img.convert("L")
@@ -533,9 +407,18 @@ def process_pdf(file_obj, opening_balance=None):
 
     return df, failed_blocks, len(blocks), ocr_used_pages
 
-#----------AI---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def process_pdf_cached(file_bytes, opening_balance):
+    file_obj = BytesIO(file_bytes)
+    return process_pdf(file_obj, opening_balance=opening_balance)
+
+
+# -------------------- AI Functions --------------------
 @st.cache_resource(show_spinner=False)
 def load_zero_shot_model():
+    if not AI_AVAILABLE:
+        return None
     try:
         classifier = pipeline(
             "zero-shot-classification",
@@ -546,157 +429,136 @@ def load_zero_shot_model():
         return None
 
 
-def lightweight_preclassify(text: str):
-    """
-    Cheap pre-filter to avoid running the model on obviously internal rows.
-    """
-    text_u = clean(text).upper()
+def lightweight_preclassify(text):
+    text = clean(text).upper()
 
-    if not text_u:
-        return {"label": "UNKNOWN", "score": 0.0, "source": "precheck"}
+    if not text:
+        return {"label": "UNKNOWN", "score": 0.0}
 
-    if any(x in text_u for x in BANK_INTERNAL_HINTS):
-        return {"label": "BANK_INTERNAL", "score": 0.99, "source": "precheck"}
+    if any(word in text for word in [
+        "BANK CHARGE", "BANK CHARGES", "GST", "SMS CHARGE",
+        "INTEREST", "SERVICE CHARGE", "ATM CHARGE", "ANNUAL CHARGE"
+    ]):
+        return {"label": "BANK_INTERNAL", "score": 0.99}
 
-    if "GOVT" in text_u or "GOVERNMENT" in text_u or "TREASURY" in text_u or "SECRETARIAT" in text_u:
-        return {"label": "GOVERNMENT", "score": 0.95, "source": "precheck"}
+    if any(word in text for word in [
+        "GOVT", "GOVERNMENT", "TREASURY", "SECRETARIAT"
+    ]):
+        return {"label": "GOVERNMENT", "score": 0.95}
 
     return None
 
 
-def classify_narration_ai(text: str, classifier):
+def classify_narration_ai(text, classifier):
     text = clean(text)
-    if not text:
-        return {"label": "UNKNOWN", "score": 0.0, "source": "empty"}
 
     pre = lightweight_preclassify(text)
     if pre:
         return pre
 
     if classifier is None:
-        return {"label": "UNKNOWN", "score": 0.0, "source": "fallback"}
+        return {"label": "UNKNOWN", "score": 0.0}
 
     candidate_labels = [
         "individual person",
         "private company or business",
-        "government office or department",
+        "government office",
         "bank internal transaction",
-        "unknown entity",
+        "unknown entity"
     ]
 
     try:
-        result = classifier(
-            text,
-            candidate_labels=candidate_labels,
-            multi_label=False
-        )
-
+        result = classifier(text, candidate_labels)
         label_map = {
             "individual person": "INDIVIDUAL",
             "private company or business": "PRIVATE_COMPANY",
-            "government office or department": "GOVERNMENT",
+            "government office": "GOVERNMENT",
             "bank internal transaction": "BANK_INTERNAL",
             "unknown entity": "UNKNOWN",
         }
 
-        top_label = result["labels"][0]
-        top_score = float(result["scores"][0])
-
         return {
-            "label": label_map.get(top_label, "UNKNOWN"),
-            "score": round(top_score, 4),
-            "source": "model",
+            "label": label_map.get(result["labels"][0], "UNKNOWN"),
+            "score": float(result["scores"][0])
         }
     except Exception:
-        return {"label": "UNKNOWN", "score": 0.0, "source": "fallback"}
+        return {"label": "UNKNOWN", "score": 0.0}
 
 
-def ai_risk_decision(description, debit, credit, classifier):
+@st.cache_data(show_spinner=False)
+def classify_unique_descriptions(descriptions_tuple):
+    classifier = load_zero_shot_model()
+    result_map = {}
+
+    for desc in descriptions_tuple:
+        result_map[desc] = classify_narration_ai(desc, classifier)
+
+    return result_map
+
+
+def ai_risk_decision(description, debit, credit, ai_result):
     text = clean(description).upper()
-    amount = max(float(debit or 0), float(credit or 0))
 
-    ai_result = classify_narration_ai(description, classifier)
-    entity_type = ai_result["label"]
+    entity = ai_result["label"]
     confidence = ai_result["score"]
-
-    has_transfer_word = any(word in text for word in TRANSFER_WORDS)
+    amount = max(float(debit or 0), float(credit or 0))
 
     score = 0
     reasons = []
 
-    # entity based score
-    if entity_type == "INDIVIDUAL":
+    if entity == "INDIVIDUAL":
         score += 35
-        reasons.append("AI detected individual/person")
-    elif entity_type == "PRIVATE_COMPANY":
+        reasons.append("Individual detected")
+    elif entity == "PRIVATE_COMPANY":
         score += 30
-        reasons.append("AI detected private company/business")
-    elif entity_type == "UNKNOWN":
+        reasons.append("Private company detected")
+    elif entity == "UNKNOWN":
         score += 15
-        reasons.append("Entity not clearly identified")
-    elif entity_type == "GOVERNMENT":
-        score += 5
-        reasons.append("AI detected government entity")
-    elif entity_type == "BANK_INTERNAL":
-        score += 0
-        reasons.append("AI detected bank/internal narration")
+        reasons.append("Unknown entity")
 
-    # channel / transfer keywords
-    if has_transfer_word:
+    if any(x in text for x in TRANSFER_WORDS):
         score += 20
-        reasons.append("Transfer mode keyword present")
+        reasons.append("Electronic transfer")
 
-    # amount based score
     if amount >= 50000:
         score += 10
-        reasons.append("Amount above 50,000")
+        reasons.append("Amount > 50k")
+
     if amount >= 200000:
         score += 15
-        reasons.append("Amount above 2,00,000")
-    if amount >= 1000000:
-        score += 10
-        reasons.append("Amount above 10,00,000")
+        reasons.append("Amount > 2L")
 
-    # confidence handling
     if 0 < confidence < 0.45:
         score += 10
         reasons.append("Low AI confidence")
 
-    # debit / credit context
-    if float(debit or 0) > 0 and entity_type in ["INDIVIDUAL", "PRIVATE_COMPANY", "UNKNOWN"]:
-        score += 10
-        reasons.append("Debit to external-looking entity")
-
-    if float(credit or 0) > 0 and entity_type in ["INDIVIDUAL", "PRIVATE_COMPANY", "UNKNOWN"]:
-        score += 8
-        reasons.append("Credit from external-looking entity")
-
     if score >= 75:
-        risk_level = "Very High"
+        level = "Very High"
     elif score >= 50:
-        risk_level = "High"
+        level = "High"
     elif score >= 30:
-        risk_level = "Medium"
+        level = "Medium"
     else:
-        risk_level = "Low"
+        level = "Low"
 
     return {
-        "entity_type": entity_type,
-        "confidence": confidence,
+        "entity_type": entity,
+        "confidence": round(confidence, 4),
         "risk_score": score,
-        "risk_level": risk_level,
-        "risk_reason": "; ".join(reasons),
+        "risk_level": level,
+        "risk_reason": "; ".join(reasons)
     }
 
 
-ddef detect_high_risk_ai(df):
-
+def detect_high_risk_ai(df):
     if df.empty:
         return df.copy(), df.copy(), df.copy()
 
     result_df = df.copy()
 
-    unique_desc = result_df["Description"].fillna("").unique().tolist()
+    unique_desc = tuple(
+        result_df["Description"].fillna("").astype(str).map(clean).unique().tolist()
+    )
 
     classification_map = classify_unique_descriptions(unique_desc)
 
@@ -705,7 +567,7 @@ ddef detect_high_risk_ai(df):
             row["Description"],
             row["Debit_num"],
             row["Credit_num"],
-            classification_map.get(row["Description"], {"label": "UNKNOWN", "score": 0})
+            classification_map.get(clean(row["Description"]), {"label": "UNKNOWN", "score": 0.0})
         ),
         axis=1
     )
@@ -719,18 +581,16 @@ ddef detect_high_risk_ai(df):
     high_debit = result_df[
         (result_df["Debit_num"] > 0) &
         (result_df["AI Risk Level"].isin(["High", "Very High"]))
-    ]
+    ].copy()
 
     high_credit = result_df[
         (result_df["Credit_num"] > 0) &
         (result_df["AI Risk Level"].isin(["High", "Very High"]))
-    ]
+    ].copy()
 
     return result_df, high_debit, high_credit
-@st.cache_data(show_spinner=False)
-def process_pdf_cached(file_bytes, opening_balance):
-    file_obj = BytesIO(file_bytes)
-    return process_pdf(file_obj, opening_balance)
+
+
 # -------------------- Excel Export --------------------
 def to_excel_bytes(df, sheet_name="Statement"):
     output = BytesIO()
@@ -763,6 +623,8 @@ def log_user_usage_to_excel(
     failed_blocks,
     ocr_used_pages
 ):
+    os.makedirs(os.path.dirname(USAGE_LOG_FILE), exist_ok=True)
+
     log_row = {
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Name": name,
@@ -1017,8 +879,9 @@ with st.sidebar:
     st.write("1. Fill user access details")
     st.write("2. Upload PDF")
     st.write("3. Enter Opening Balance manually")
-    st.write("4. Review totals and AI risk flags")
-    st.write("5. Download Excel")
+    st.write("4. Click Run Analysis")
+    st.write("5. Review totals and AI risk flags")
+    st.write("6. Download Excel")
 
     if not OCR_AVAILABLE:
         st.warning("OCR fallback is not available in this environment.")
@@ -1080,16 +943,23 @@ if opening_balance_input.strip() and opening_balance is None:
     st.error("Invalid opening balance format. Use format like 90817476.00Cr or 1250.00Dr")
     st.stop()
 
+run_analysis = st.button("Run Analysis", use_container_width=True)
+
 # -------------------- Main --------------------
 if uploaded_file is None:
     st.info("Please upload a Jammu & Kashmir Bank statement PDF to begin analysis.")
+elif not run_analysis:
+    st.info("Upload the file and click Run Analysis.")
 else:
     try:
         with st.spinner("Processing PDF and running AI risk analysis..."):
-            df, failed_blocks, total_blocks, ocr_used_pages = process_pdf(
-                uploaded_file,
-                opening_balance=opening_balance
+            file_bytes = uploaded_file.getvalue()
+
+            df, failed_blocks, total_blocks, ocr_used_pages = process_pdf_cached(
+                file_bytes,
+                opening_balance
             )
+
             df, high_debit, high_credit = detect_high_risk_ai(df)
 
         if df.empty:
@@ -1231,4 +1101,3 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
